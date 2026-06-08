@@ -38,10 +38,10 @@ pub enum Request {
     /// This is the time-boxed outer envelope ("capture security"): it is
     /// TouchID-gated and the captured values live only in daemon memory until
     /// `ttl_secs` elapses or they are explicitly cleared. The client never
-    /// reads the file — `path` is resolved (relative to `cwd`) by the daemon.
+    /// reads the file — `path` is resolved by the daemon relative to the
+    /// caller's *verified* cwd (derived from the peer pid, not sent here).
     Capture {
         path: String,
-        cwd: String,
         ttl_secs: Option<u64>,
     },
 
@@ -54,12 +54,12 @@ pub enum Request {
     /// Run `argv` with `secrets` injected into the child process only.
     ///
     /// Requires (a) an active capture providing every requested name, and
-    /// (b) a per-use approval — the inner gate. The child's output is
-    /// redacted of the injected values before being returned.
+    /// (b) a per-use approval — the inner gate. The child runs in the caller's
+    /// verified cwd (derived daemon-side); its output is redacted of the
+    /// injected values before being returned.
     Run {
         secrets: Vec<String>,
         argv: Vec<String>,
-        cwd: String,
     },
 }
 
