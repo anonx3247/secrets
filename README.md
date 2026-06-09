@@ -31,5 +31,22 @@ sx status                             # granted files + mode + names (never valu
 sx clear .env                         # revoke early
 ```
 
+## Teaching agents to use it
+
+[`SKILL.md`](./SKILL.md) is an Agent-Skills skill that tells a coding agent to
+reach for `sx run --env` (and never to read secret values). Install it into the
+agents you use:
+
+```sh
+sx skill install                 # Claude Code, Codex, and Pi (all three)
+sx skill install --claude        # just one; --print for a dry run
+sx skill uninstall               # remove it
+```
+
+All three implement the same Agent Skills standard, so it's the same `SKILL.md`
+in each one's skills directory: `~/.claude/skills/sx/SKILL.md` (Claude Code),
+`~/.codex/skills/sx/SKILL.md` (Codex), and `~/.pi/agent/skills/sx/SKILL.md`
+(Pi). Restart a running agent session to pick it up.
+
 See [DESIGN.md](./DESIGN.md) for the threat model, the double-gate model, and
 known v1 simplifications.
