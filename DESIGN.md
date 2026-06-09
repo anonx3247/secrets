@@ -93,8 +93,9 @@ sandbox — see "Trusting `sx`" below.
   granted secrets in memory with a 1h TTL. Never executes a command.
 - **`sx`** — the in-sandbox client. For `run`, it receives the granted values and
   execs the command itself, redacting the values from the child's output.
-  Subcommands: `run` (`--env <path>`, `--grant-all`), `grant-all`, `clear`,
-  `status`/`list`.
+  Subcommands: `run` (`--env <path>`, `--aws-profile <name>`, `--grant-all`),
+  `grant-all`, `clear` (`--aws-profile <name>` or a path), `status`/`list`.
+  `run`/`grant-all` require at least one `--env` or `--aws-profile`.
 
 ## Trusting `sx`
 
@@ -117,9 +118,10 @@ and casual-exfil guarantees still hold.
 
 ## The two gates
 
-Two independent, time-boxed human checkpoints. `--env <path>` is required on
-every call (no ambient session state); paths are resolved against the caller's
-verified cwd and **canonicalized**.
+Two independent, time-boxed human checkpoints. A source (`--env <path>` and/or
+`--aws-profile <name>`) is required on every call (no ambient session state);
+`.env` paths are resolved against the caller's verified cwd and **canonicalized**,
+while AWS profiles are keyed under a synthetic `aws:<profile>` identity.
 
 1. **File grant (per `.env`, 1 hour).** The first use of a canonical path shows
    it (plus the command that triggered it) and asks the user (TouchID) to grant
@@ -163,13 +165,33 @@ sx run --env .env -- gh pr create --title "..."
 
 ## Backends
 
+A *source* is anything the daemon can turn into a name→value map. Every source
+sits behind the same daemon, the same 1h grant/TTL, the same double gate, the
+same `status`/`clear`, and the same output redaction — they differ only in how
+values are produced and in the subject shown at the human prompt.
+
 - **`.env` (today).** Frictionless: point `--env` at a file in any project dir.
   Plaintext at rest — security rests on the daemon being outside the sandbox.
+  Keyed in daemon memory under the file's canonical path.
+- **AWS profile (today).** `--aws-profile <name>` mints *temporary* credentials
+  by shelling out to the AWS CLI:
+  `aws configure export-credentials --profile <name> --format env-no-export`.
+  The CLI is the source of truth for the user's profile config, so this one
+  mechanism uniformly resolves **SSO**, **assume-role**, and **static** profiles
+  and prints `KEY=VALUE` lines (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+  `AWS_SESSION_TOKEN`, and usually `AWS_CREDENTIAL_EXPIRATION` / `AWS_REGION`),
+  injected verbatim. No AWS SDK is linked in. The grant is keyed under a
+  synthetic `aws:<profile>` source (never a filesystem path, so it bypasses cwd
+  resolution/canonicalization) and held for the same 1h TTL; `sx clear
+  --aws-profile <name>` revokes it early. If `aws` is missing or exits non-zero,
+  the daemon returns the captured stderr as a denial/error — it never folds that
+  output into a successful grant. A single `sx run --env .env --aws-profile prod
+  -- cmd` runs every gate and merges both sources' values.
 - **OS keychain (planned).** Via the `keyring` crate (macOS Keychain, Linux
   Secret Service, Windows Credential Manager). Adds encryption at rest and, on
   macOS, a hardware-backed `kSecAccessControl`/TouchID gate on the item itself.
 
-Both sit behind the same daemon and the same double gate.
+All sources sit behind the same daemon and the same double gate.
 
 ## Agent integration
 

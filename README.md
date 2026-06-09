@@ -8,9 +8,10 @@ lets programs the agent runs *use* secrets without letting the agent *read*
 them, with a human in the loop: a TouchID grant per `.env` file (1 hour) and, by
 default, a confirmation of every command.
 
-- **`sxd`** — a secrets oracle outside the sandbox. Reads `.env` files, grants a
-  file for 1 hour on first use, confirms each command (unless the file is
-  `grant-all`), and releases values. It never executes anything.
+- **`sxd`** — a secrets oracle outside the sandbox. Reads `.env` files (or mints
+  temporary AWS credentials from a named profile), grants a source for 1 hour on
+  first use, confirms each command (unless the source is `grant-all`), and
+  releases values. It never executes anything.
 - **`sx`** — the in-sandbox client. For `run`, it receives the granted values,
   injects them, and execs the command as **its own** child — so the child
   inherits `sx`'s sandbox and the daemon is never a way out of it. Redacts the
@@ -49,6 +50,12 @@ sx run --env .env -- gh pr merge      # no prompt
 
 sx status                             # granted files + mode + names (never values)
 sx clear .env                         # revoke early
+
+# AWS profiles are a second source: sxd mints temporary credentials for the
+# named profile and injects them, gated and TTL'd exactly like a .env grant.
+sx run --aws-profile prod -- aws s3 ls          # 1st use: grant + confirm; SSO/role/static all work
+sx run --env .env --aws-profile prod -- deploy  # merge both sources in one run
+sx clear --aws-profile prod                     # revoke a single profile grant
 ```
 
 ## Teaching agents to use it
