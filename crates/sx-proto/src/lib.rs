@@ -40,20 +40,31 @@ pub enum Request {
     /// Report active grants and the secret names they expose (never values).
     Status,
 
+    /// Pre-authorize one or more `.env` files in *allow-all* mode: grant the
+    /// file for an hour AND suppress the per-command prompt for that window.
+    /// Runs no command — `sx grant-all --env <path>`.
+    GrantAll { env: Vec<String> },
+
     /// Request the secrets from one or more `.env` files in order to run `argv`.
     ///
     /// The daemon does NOT execute anything. For each `env` path it resolves
     /// the file against the caller's *verified* cwd (derived from the peer pid,
-    /// not sent here); on the first use of a path it gates a time-boxed grant
-    /// (TouchID), and caches it so later runs within the window don't re-prompt.
-    /// It then returns the merged values via [`Response::Granted`]. The client
-    /// (`sx`), inside the sandbox, injects them and execs `argv` itself, so the
-    /// child inherits the client's confinement and the daemon is never an
-    /// executor. `argv` is sent only so the daemon can show it at the grant
-    /// prompt; the daemon does not run it.
+    /// not sent here). Two independent gates apply:
+    ///
+    /// * **file grant** — on first use of a path, a 1h TouchID grant reads the
+    ///   file into memory; later runs reuse it without re-reading.
+    /// * **per-command** — by default *every* run prompts to approve this
+    ///   specific command. A file in allow-all mode (via [`Request::GrantAll`]
+    ///   or `grant_all` here) skips this prompt for its window.
+    ///
+    /// It returns the merged values via [`Response::Granted`]; the client (`sx`)
+    /// injects them and execs `argv` itself. `argv` is sent so the daemon can
+    /// show it at the per-command prompt; the daemon does not run it.
     Run {
         env: Vec<String>,
         argv: Vec<String>,
+        /// Upgrade the files used here to allow-all for the rest of their grant.
+        grant_all: bool,
     },
 }
 
@@ -80,10 +91,12 @@ pub enum Response {
     Error { message: String },
 }
 
-/// Summary of one active capture, safe to show the agent.
+/// Summary of one active grant, safe to show the agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureInfo {
     pub source: String,
     pub names: Vec<String>,
     pub expires_in_secs: u64,
+    /// True when this file is in allow-all mode (no per-command prompt).
+    pub allow_all: bool,
 }

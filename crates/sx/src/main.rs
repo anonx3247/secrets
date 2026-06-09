@@ -39,17 +39,30 @@ enum Cmd {
     Status,
     /// Alias for `status`, framed as "what secrets can I use right now".
     List,
+    /// Grant a .env file for 1h AND allow all its commands without per-command
+    /// prompts. Runs nothing — use this to opt a file out of confirmation.
+    ///
+    /// Example: sx grant-all --env .env
+    GrantAll {
+        /// Path to a .env file to allow-all (repeatable, required).
+        #[arg(long = "env", required = true)]
+        env: Vec<String>,
+    },
     /// Run a command with the secrets from one or more .env files injected.
     ///
-    /// The first use of a given .env prompts for a 1-hour grant; later runs
-    /// within the window reuse it without prompting. The path must be given
-    /// each call.
+    /// The first use of a given .env prompts for a 1-hour grant; by default
+    /// every command is then confirmed individually. Pass --grant-all to opt
+    /// the file(s) out of per-command confirmation for the window. The path
+    /// must be given each call.
     ///
     /// Example: sx run --env .env -- gh pr create
     Run {
         /// Path to a .env file whose secrets to inject (repeatable, required).
         #[arg(long = "env", required = true)]
         env: Vec<String>,
+        /// Skip per-command confirmation for these file(s) for the grant window.
+        #[arg(long = "grant-all")]
+        grant_all: bool,
         /// The command and its arguments, after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
@@ -77,7 +90,12 @@ fn run() -> Result<ExitCode> {
     // working directory from the verified peer pid to resolve the --env paths,
     // so a compromised client cannot fake where the files live.
     match cli.command {
-        Cmd::Run { env, argv } => exec_with_secrets(env, argv),
+        Cmd::Run {
+            env,
+            grant_all,
+            argv,
+        } => exec_with_secrets(env, argv, grant_all),
+        Cmd::GrantAll { env } => Ok(render(send(&Request::GrantAll { env })?)),
         Cmd::Clear { path } => Ok(render(send(&Request::Clear { path })?)),
         Cmd::Status | Cmd::List => Ok(render(send(&Request::Status)?)),
     }
@@ -85,10 +103,11 @@ fn run() -> Result<ExitCode> {
 
 /// Ask the daemon (gated) for the secrets in `env`, then inject and exec `argv`
 /// as our own child, redacting the secret values from its output.
-fn exec_with_secrets(env: Vec<String>, argv: Vec<String>) -> Result<ExitCode> {
+fn exec_with_secrets(env: Vec<String>, argv: Vec<String>, grant_all: bool) -> Result<ExitCode> {
     let response = send(&Request::Run {
         env,
         argv: argv.clone(),
+        grant_all,
     })?;
 
     let granted = match response {
@@ -172,7 +191,16 @@ fn render(response: Response) -> ExitCode {
                 println!("no active grants");
             } else {
                 for c in captures {
-                    println!("{} (expires in {}m)", c.source, c.expires_in_secs / 60);
+                    let mode = if c.allow_all {
+                        " [allow-all]"
+                    } else {
+                        " [confirm each command]"
+                    };
+                    println!(
+                        "{} (expires in {}m){mode}",
+                        c.source,
+                        c.expires_in_secs / 60
+                    );
                     for n in c.names {
                         println!("  {n}");
                     }

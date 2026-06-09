@@ -25,8 +25,9 @@ with arbitrary code execution from exfiltrating a secret it has been allowed to
 use. What we *do* provide:
 
 1. The secret value never enters the agent's own process or context.
-2. Access to a secret store is **gated by a human** — a TouchID grant, per
-   `.env` file, on first use, lasting one hour.
+2. Access is **gated by a human** at two levels — a TouchID grant per `.env`
+   file (1 hour), and, by default, a confirmation of each command — unless the
+   file is explicitly opted out with `grant-all`.
 3. Casual/accidental leakage (secrets in transcripts, logs, echoed output) is
    blocked by redaction.
 
@@ -39,10 +40,11 @@ deployment concern, layered on top — not something this tool can do alone.
 - **Primary: the careless agent.** Keep secrets out of the LLM transcript, logs,
   scrollback, and disk locations a sandbox can't protect. Fully addressed.
 - **Secondary: casual exfiltration.** `printenv`, echoed secrets, obvious
-  `curl` to an attacker. Partially addressed: the human sees the file and the
-  first command at grant time, and output redaction scrubs echoes — but within
-  the 1h grant window subsequent commands run unprompted, so this leans on
-  redaction (and egress restriction) more than on the human.
+  `curl` to an attacker. Addressed by the per-command prompt (the human sees the
+  exact command before any value is released) plus output redaction. A file
+  opted into `grant-all` waives the per-command prompt for its window, leaning on
+  redaction (and egress restriction) instead — so reserve it for low-sensitivity
+  files.
 - **Out of scope alone: a determined malicious agent** that launders the secret
   through an approved-but-trojaned command (e.g. an agent-authored `deploy.sh`).
   Mitigated only when combined with network egress control.
@@ -91,7 +93,8 @@ sandbox — see "Trusting `sx`" below.
   granted secrets in memory with a 1h TTL. Never executes a command.
 - **`sx`** — the in-sandbox client. For `run`, it receives the granted values and
   execs the command itself, redacting the values from the child's output.
-  Subcommands: `run` (`--env <path>`), `clear`, `status`/`list`.
+  Subcommands: `run` (`--env <path>`, `--grant-all`), `grant-all`, `clear`,
+  `status`/`list`.
 
 ## Trusting `sx`
 
@@ -112,25 +115,33 @@ Until both land, the grant binding is only as strong as the agent's honesty: a
 same-uid impostor could obtain values once a grant is live. The careless-agent
 and casual-exfil guarantees still hold.
 
-## The grant gate
+## The two gates
 
-A single human checkpoint, per `.env` file, time-boxed:
+Two independent, time-boxed human checkpoints. `--env <path>` is required on
+every call (no ambient session state); paths are resolved against the caller's
+verified cwd and **canonicalized**.
 
-`sx run --env <path> -- cmd …` resolves `<path>` against the caller's verified
-cwd and **canonicalizes it**. On the **first use** of that canonical path the
-daemon shows it (plus the command that triggered it) and asks the user (TouchID)
-to grant access for **one hour**. On approval the file's values are read into
-daemon memory with a 1h TTL. Every later `sx run --env <same path>` within the
-window reuses the grant **without prompting**; after it expires, the next run
-re-prompts. `--env` must be passed on every call (no ambient session state), and
-`sx clear <path>` revokes a grant early.
+1. **File grant (per `.env`, 1 hour).** The first use of a canonical path shows
+   it (plus the command that triggered it) and asks the user (TouchID) to grant
+   that file for one hour. On approval the values are read into daemon memory
+   with a 1h TTL; later runs reuse them without re-reading the file. This bounds
+   *which* files are live and *for how long*. `sx clear <path>` revokes early.
 
-This is the `sudo`-timestamp / `aws-vault` ergonomic model: approve a source
-once, use it freely for a bounded window. The deliberate trade vs. a per-command
-prompt: **within the hour, any command the agent runs against a granted file is
-unprompted** — redaction and (eventually) network-egress restriction are the
-only backstops then, not a human. A per-command `--confirm` mode could be added
-for high-sensitivity files.
+2. **Per-command confirmation (default, every run).** By default *every*
+   `sx run --env <path> -- cmd` prompts to approve **that specific command**
+   before the values are released — a live file grant does **not** authorize
+   silent use. (On the very first run the file-grant prompt doubles as the first
+   command's confirmation.) Re-validated after approval, so a grant that expires
+   at the prompt is denied.
+
+**Opting a file out — `grant-all`.** `sx grant-all --env <path>` (or
+`sx run --grant-all --env <path> -- cmd`) marks a file *allow-all* for its 1h
+window: one prompt up front, then no per-command confirmation. This is the
+`sudo`-timestamp / `aws-vault` ergonomic escape hatch, **off by default** — you
+ask for it per file. While allow-all, any command against that file is
+unprompted, so redaction and (eventually) egress restriction are the only
+backstops; reserve it for low-sensitivity files. `sx status` shows each grant's
+mode (`[confirm each command]` vs `[allow-all]`).
 
 ## How a secret is used
 
@@ -138,11 +149,11 @@ for high-sensitivity files.
 sx run --env .env -- gh pr create --title "..."
 ```
 
-1. `sx` sends `{env:[".env"], argv:[gh, pr, create, …]}`.
+1. `sx` sends `{env:[".env"], argv:[gh, pr, create, …], grant_all:false}`.
 2. Daemon derives the caller's cwd (verified peer pid), resolves + canonicalizes
    each `--env` path.
-3. For each path: if a live grant exists, reuse it; otherwise prompt the 1h
-   grant (showing path + command), refusal → `Denied`, then read the file.
+3. For each path it runs the two gates: grant the file if not live, then (unless
+   the file is allow-all) confirm this command. Refusal → `Denied`.
 4. Daemon returns `Granted{secrets}` — the merged values — to `sx`. It spawns
    nothing.
 5. `sx` injects the values and execs `gh …` as **its own child**, in `sx`'s cwd,
@@ -203,9 +214,6 @@ The grant gate is an `ApprovalGate` trait with three implementations:
 - **`sx` identity is not yet attested.** The plaintext is released to whatever
   same-uid process connects; until audit-token code-sign attestation lands, an
   impostor `sx` could obtain it (see "Trusting `sx`").
-- **No per-command confirmation.** A grant authorizes a `.env` for an hour;
-  every command in that window runs unprompted. An opt-in `--confirm` mode
-  (TouchID per command for high-sensitivity files) is a possible addition.
 - **No per-session grant scoping yet.** Peer auth restricts callers to the
   owning uid, but any process of that uid can use a live grant. Grants should
   additionally be scoped to the session that created them.

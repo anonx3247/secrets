@@ -175,7 +175,12 @@ impl Daemon {
             Request::Status => Response::Status {
                 captures: self.state.lock().unwrap().info(),
             },
-            Request::Run { env, argv } => self.run(env, argv, peer),
+            Request::GrantAll { env } => self.grant_all(env, peer),
+            Request::Run {
+                env,
+                argv,
+                grant_all,
+            } => self.run(env, argv, grant_all, peer),
         }
     }
 
@@ -196,15 +201,44 @@ impl Daemon {
         }
     }
 
-    /// Resolve each `.env`, granting (TouchID, 1h) any not already live, then
-    /// return the merged values for the client to inject and exec `argv`.
-    ///
-    /// The grant for a given file is prompted only on its first use within the
-    /// window; later runs reuse the cached values without prompting. The daemon
-    /// never spawns `argv` — it only shows it at the grant prompt so the user
-    /// knows what the access is for. Execution happens entirely in the
-    /// in-sandbox client.
-    fn run(&self, env: Vec<String>, argv: Vec<String>, peer: &Peer) -> Response {
+    /// Pre-authorize files in allow-all mode (no command). Prompts once per
+    /// file to grant it for the window with the per-command prompt suppressed.
+    fn grant_all(&self, env: Vec<String>, peer: &Peer) -> Response {
+        if env.is_empty() {
+            return Response::Error {
+                message: "grant-all requires at least one --env <path>".to_string(),
+            };
+        }
+        let cwd = match peer.cwd() {
+            Ok(c) => c,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("cannot determine caller cwd (pid {}): {e}", peer.pid),
+                }
+            }
+        };
+        for path in &env {
+            let resolved = match resolve(&cwd, path) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Response::Error {
+                        message: format!("cannot resolve {path}: {e}"),
+                    }
+                }
+            };
+            let source = resolved.display().to_string();
+            if let Err(resp) = self.authorize(&source, &resolved, None, true) {
+                return resp;
+            }
+        }
+        Response::Ok {
+            message: format!("allow-all granted for {} file(s) (1h)", env.len()),
+        }
+    }
+
+    /// Resolve each `.env`, run both gates, then return the merged values for
+    /// the client to inject and exec `argv`.
+    fn run(&self, env: Vec<String>, argv: Vec<String>, grant_all: bool, peer: &Peer) -> Response {
         if argv.is_empty() {
             return Response::Error {
                 message: "run requires a command".to_string(),
@@ -226,7 +260,7 @@ impl Daemon {
         };
 
         // Merge the values of every requested file, in order (later files win),
-        // granting first-seen files along the way.
+        // running both gates per file along the way.
         let mut merged: Vec<(String, String)> = Vec::new();
         for path in &env {
             let resolved = match resolve(&cwd, path) {
@@ -239,7 +273,7 @@ impl Daemon {
             };
             let source = resolved.display().to_string();
 
-            let values = match self.grant(&source, &resolved, &argv) {
+            let values = match self.authorize(&source, &resolved, Some(&argv), grant_all) {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
@@ -252,25 +286,78 @@ impl Daemon {
         Response::Granted { secrets: merged }
     }
 
-    /// Return the values for one already-resolved `.env`, prompting a 1h grant
-    /// on first use. `Err(Response)` carries a denial/error to return verbatim.
-    fn grant(
+    /// The two gates for one already-resolved `.env`.
+    ///
+    /// * **File grant** — if no live grant exists, prompt a 1h grant and read
+    ///   the file. `make_allow_all` decides whether the new grant is allow-all.
+    /// * **Per-command** — when the grant is *not* allow-all and `argv` is
+    ///   `Some`, prompt to approve this specific command. `make_allow_all`
+    ///   upgrades a live confirm-mode grant to allow-all (prompted) instead.
+    ///
+    /// `argv == None` means "pre-authorize only" (no command to confirm).
+    /// `Err(Response)` carries a denial/error to return verbatim.
+    fn authorize(
         &self,
         source: &str,
         resolved: &Path,
-        argv: &[String],
+        argv: Option<&[String]>,
+        make_allow_all: bool,
     ) -> Result<Vec<(String, String)>, Response> {
-        // Already granted and still live → no prompt.
-        if let Some(values) = self.state.lock().unwrap().live_values(source) {
-            return Ok(values);
+        let live = self.state.lock().unwrap().live(source);
+
+        // First use of this file → file-grant gate (reads the file fresh).
+        let Some(live) = live else {
+            return self.establish_grant(source, resolved, argv, make_allow_all);
+        };
+
+        // Already allow-all, and not asked to change → no prompt.
+        if live.allow_all && !make_allow_all {
+            return Ok(live.values);
         }
 
-        let prompt = format!(
-            "Grant access to secrets in:\n  {}\nfor {} minutes. First use is to run:\n  {}",
-            resolved.display(),
-            GRANT_TTL_SECS / 60,
-            argv.join(" ")
-        );
+        // Asked to upgrade a confirm-mode grant to allow-all.
+        if make_allow_all {
+            if !self.gate.approve(&allow_all_prompt(resolved)) {
+                return Err(Response::Denied {
+                    reason: format!("allow-all not approved for {source}"),
+                });
+            }
+            self.state
+                .lock()
+                .unwrap()
+                .set_allow_all(source, Duration::from_secs(GRANT_TTL_SECS));
+            return Ok(live.values);
+        }
+
+        // Confirm-mode grant + a command → per-command gate.
+        let argv = argv.expect("confirm-mode path always has a command");
+        if !self.gate.approve(&per_command_prompt(resolved, argv)) {
+            return Err(Response::Denied {
+                reason: "command not approved".to_string(),
+            });
+        }
+        // Re-resolve after approval: the grant may have expired at the prompt.
+        match self.state.lock().unwrap().live(source) {
+            Some(g) => Ok(g.values),
+            None => Err(Response::Denied {
+                reason: format!("grant for {source} expired during approval"),
+            }),
+        }
+    }
+
+    /// First-use file grant: prompt, read the file, store it.
+    fn establish_grant(
+        &self,
+        source: &str,
+        resolved: &Path,
+        argv: Option<&[String]>,
+        allow_all: bool,
+    ) -> Result<Vec<(String, String)>, Response> {
+        let prompt = if allow_all {
+            allow_all_prompt(resolved)
+        } else {
+            first_run_prompt(resolved, argv)
+        };
         if !self.gate.approve(&prompt) {
             return Err(Response::Denied {
                 reason: format!("grant not approved for {source}"),
@@ -290,12 +377,41 @@ impl Daemon {
             source.to_string(),
             values.clone(),
             Duration::from_secs(GRANT_TTL_SECS),
+            allow_all,
         );
 
         let mut out: Vec<(String, String)> = values.into_iter().collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
+}
+
+fn first_run_prompt(resolved: &Path, argv: Option<&[String]>) -> String {
+    let mut p = format!(
+        "Grant access to secrets in:\n  {}\nfor {} minutes.",
+        resolved.display(),
+        GRANT_TTL_SECS / 60
+    );
+    if let Some(argv) = argv {
+        p.push_str(&format!("\nThis command will run:\n  {}", argv.join(" ")));
+    }
+    p
+}
+
+fn per_command_prompt(resolved: &Path, argv: &[String]) -> String {
+    format!(
+        "Run command:\n  {}\nwith secrets from:\n  {}",
+        argv.join(" "),
+        resolved.display()
+    )
+}
+
+fn allow_all_prompt(resolved: &Path) -> String {
+    format!(
+        "Allow ALL commands to use secrets in:\n  {}\nfor {} minutes, without confirming each one.",
+        resolved.display(),
+        GRANT_TTL_SECS / 60
+    )
 }
 
 /// Resolve `path` relative to `cwd` and canonicalize it (file must exist).
