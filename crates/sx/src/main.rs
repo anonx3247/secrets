@@ -69,20 +69,18 @@ fn main() -> ExitCode {
 
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
-    let cwd = std::env::current_dir()
-        .context("getting current directory")?
-        .to_string_lossy()
-        .into_owned();
 
+    // Note: we deliberately do NOT send our cwd. The daemon derives the
+    // caller's working directory from the verified peer pid, so a compromised
+    // client cannot point it at an arbitrary `.env`.
     let request = match cli.command {
         Cmd::Capture { path, ttl } => Request::Capture {
             path,
-            cwd,
             ttl_secs: Some(ttl * 60),
         },
         Cmd::Clear { path } => Request::Clear { path },
         Cmd::Status | Cmd::List => Request::Status,
-        Cmd::Run { secrets, argv } => Request::Run { secrets, argv, cwd },
+        Cmd::Run { secrets, argv } => Request::Run { secrets, argv },
     };
 
     let response = send(&request)?;

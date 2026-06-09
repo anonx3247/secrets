@@ -6,14 +6,18 @@
 //! processes it spawns on the client's behalf — gating each use and redacting
 //! the values out of the child's output before returning it.
 //!
+//! The caller is authenticated via socket peer credentials: only the owning
+//! uid may connect, and the `.env` path / child cwd are resolved against the
+//! caller's *verified* working directory (derived from its pid), never a field
+//! the client supplies.
+//!
 //! v1 simplifications (see DESIGN.md):
 //!   * the spawned child is NOT yet re-sandboxed — it inherits the daemon's
 //!     (unsandboxed) context. Production must re-apply the agent's sandbox to
 //!     the child so `run` is not an escape hatch.
-//!   * `cwd` is supplied by the client; it should instead be derived from the
-//!     caller's verified pid (peer creds) to stop path-spoofing.
 
 mod gate;
+mod peer;
 mod state;
 
 use std::collections::HashMap;
@@ -28,6 +32,7 @@ use anyhow::{Context, Result};
 use sx_proto::{socket_path, Request, Response, DEFAULT_TTL_SECS};
 
 use gate::{AllowAllGate, ApprovalGate, CliGate};
+use peer::Peer;
 use state::State;
 
 struct Daemon {
@@ -85,20 +90,9 @@ fn main() -> Result<()> {
 }
 
 impl Daemon {
-    /// Read one request, dispatch it, write one response.
+    /// Authenticate the peer, read one request, dispatch it, write one response.
     fn handle(&self, stream: UnixStream) -> Result<()> {
-        let mut reader = BufReader::new(stream.try_clone()?);
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            return Ok(()); // client closed without sending
-        }
-
-        let response = match serde_json::from_str::<Request>(line.trim()) {
-            Ok(req) => self.dispatch(req),
-            Err(e) => Response::Error {
-                message: format!("malformed request: {e}"),
-            },
-        };
+        let response = self.authenticate_and_dispatch(&stream);
 
         let mut out = stream;
         let mut buf = serde_json::to_vec(&response)?;
@@ -108,13 +102,70 @@ impl Daemon {
         Ok(())
     }
 
-    fn dispatch(&self, req: Request) -> Response {
+    /// Verify the caller, derive its cwd, then read and dispatch the request.
+    /// Every failure path returns a `Response` so the client always hears back.
+    fn authenticate_and_dispatch(&self, stream: &UnixStream) -> Response {
+        let peer = match Peer::from_stream(stream) {
+            Ok(p) => p,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("cannot read peer credentials: {e}"),
+                }
+            }
+        };
+
+        // Only the owning user may reach their own secrets.
+        if peer.uid != peer::own_uid() {
+            return Response::Denied {
+                reason: format!("connection from uid {} refused", peer.uid),
+            };
+        }
+
+        let cwd = match peer.cwd() {
+            Ok(c) => c,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("cannot determine caller cwd (pid {}): {e}", peer.pid),
+                }
+            }
+        };
+
+        let mut reader = BufReader::new(match stream.try_clone() {
+            Ok(s) => s,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("socket error: {e}"),
+                }
+            }
+        });
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                return Response::Error {
+                    message: "client closed without sending a request".to_string(),
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Response::Error {
+                    message: format!("read error: {e}"),
+                }
+            }
+        }
+
+        match serde_json::from_str::<Request>(line.trim()) {
+            Ok(req) => self.dispatch(req, &cwd),
+            Err(e) => Response::Error {
+                message: format!("malformed request: {e}"),
+            },
+        }
+    }
+
+    fn dispatch(&self, req: Request, cwd: &Path) -> Response {
         match req {
-            Request::Capture {
-                path,
-                cwd,
-                ttl_secs,
-            } => self.capture(path, cwd, ttl_secs.unwrap_or(DEFAULT_TTL_SECS)),
+            Request::Capture { path, ttl_secs } => {
+                self.capture(path, cwd, ttl_secs.unwrap_or(DEFAULT_TTL_SECS))
+            }
             Request::Clear { path } => {
                 let n = self.state.lock().unwrap().clear(path.as_deref());
                 Response::Ok {
@@ -124,13 +175,13 @@ impl Daemon {
             Request::Status => Response::Status {
                 captures: self.state.lock().unwrap().info(),
             },
-            Request::Run { secrets, argv, cwd } => self.run(secrets, argv, cwd),
+            Request::Run { secrets, argv } => self.run(secrets, argv, cwd),
         }
     }
 
     /// Capture gate: resolve + canonicalize the path, ask the user, read it.
-    fn capture(&self, path: String, cwd: String, ttl_secs: u64) -> Response {
-        let resolved = match resolve(&cwd, &path) {
+    fn capture(&self, path: String, cwd: &Path, ttl_secs: u64) -> Response {
+        let resolved = match resolve(cwd, &path) {
             Ok(p) => p,
             Err(e) => {
                 return Response::Error {
@@ -175,7 +226,7 @@ impl Daemon {
     }
 
     /// Per-use gate: resolve names from active captures, confirm, spawn child.
-    fn run(&self, secrets: Vec<String>, argv: Vec<String>, cwd: String) -> Response {
+    fn run(&self, secrets: Vec<String>, argv: Vec<String>, cwd: &Path) -> Response {
         if argv.is_empty() {
             return Response::Error {
                 message: "run requires a command".to_string(),
@@ -216,7 +267,7 @@ impl Daemon {
         }
 
         let mut cmd = Command::new(&argv[0]);
-        cmd.args(&argv[1..]).current_dir(&cwd);
+        cmd.args(&argv[1..]).current_dir(cwd);
         for (k, v) in &injected {
             cmd.env(k, v);
         }
@@ -238,12 +289,12 @@ impl Daemon {
 }
 
 /// Resolve `path` relative to `cwd` and canonicalize it (file must exist).
-fn resolve(cwd: &str, path: &str) -> std::io::Result<PathBuf> {
+fn resolve(cwd: &Path, path: &str) -> std::io::Result<PathBuf> {
     let p = Path::new(path);
     let joined = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        Path::new(cwd).join(p)
+        cwd.join(p)
     };
     joined.canonicalize()
 }

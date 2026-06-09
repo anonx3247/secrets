@@ -133,18 +133,30 @@ Both sit behind the same daemon and the same double gate.
   agents get secrets as a first-class tool. Note MCP results land in the model's
   context, so redaction matters there too.
 
+## Peer authentication (implemented)
+
+The daemon never trusts what the client *says* about its identity or location.
+On each connection it reads the peer's credentials from the kernel via the
+socket:
+
+- **uid** via `getpeereid` — connections from any uid other than the daemon's
+  own are refused, so only the owning user can reach their secrets.
+- **pid** via `LOCAL_PEERPID` (macOS) / `SO_PEERCRED` (Linux), from which the
+  daemon derives the caller's **verified cwd** (`proc_pidinfo` /
+  `PROC_PIDVNODEPATHINFO` on macOS, `/proc/<pid>/cwd` on Linux).
+
+`.env` paths are resolved, and `run` children are spawned, against that derived
+cwd — the client sends no `cwd` field at all, so it cannot point the daemon at
+an arbitrary `.env` or run a child in a directory it doesn't actually occupy.
+
 ## Known v1 simplifications (tracked, not hidden)
 
 - **The spawned child is not re-sandboxed.** It currently inherits the daemon's
   (unsandboxed) context, which makes `run` an escape hatch. Production must
   re-apply the agent's sandbox to the child.
-- **`cwd` is supplied by the client.** It should be derived from the caller's
-  verified pid via socket peer credentials (`LOCAL_PEERPID` on macOS,
-  `SO_PEERCRED` on Linux) to stop path spoofing. The capture-time path prompt
-  partially compensates (the user sees the absolute path).
-- **No peer authentication / per-session scoping yet.** Any process that can
-  reach the socket during a live capture can request injection. Captures should
-  be scoped to the requesting session.
+- **No per-session capture scoping yet.** Peer auth restricts callers to the
+  owning uid, but any process of that uid can use a live capture. Captures
+  should additionally be scoped to the session that created them.
 - **The approval gate is terminal y/N (`CliGate`).** TouchID
   (`LAContext` / `kSecAccessControl`) is the intended macOS implementation;
   `AllowAllGate` (`--no-gate`) exists only for tests.
@@ -154,9 +166,10 @@ Both sit behind the same daemon and the same double gate.
 
 ## Roadmap
 
-1. TouchID-backed gate on macOS.
-2. Peer-credential auth + cwd derivation + per-session capture scoping.
-3. Re-sandbox the spawned child.
-4. Keychain backend.
-5. MCP server.
-6. Streaming output with incremental redaction.
+1. ~~Peer-credential auth + cwd derivation.~~ **Done.**
+2. TouchID-backed gate on macOS.
+3. Per-session capture scoping.
+4. Re-sandbox the spawned child.
+5. Keychain backend.
+6. MCP server.
+7. Streaming output with incremental redaction.
