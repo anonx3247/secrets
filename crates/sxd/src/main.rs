@@ -28,7 +28,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use sx_proto::{socket_path, Request, Response, DEFAULT_TTL_SECS};
+use sx_proto::{socket_path, Request, Response, GRANT_TTL_SECS};
 
 use gate::{AllowAllGate, ApprovalGate, CliGate};
 use peer::Peer;
@@ -171,25 +171,16 @@ impl Daemon {
 
     fn dispatch(&self, req: Request, peer: &Peer) -> Response {
         match req {
-            Request::Capture { path, ttl_secs } => {
-                let cwd = match peer.cwd() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return Response::Error {
-                            message: format!(
-                                "cannot determine caller cwd (pid {}): {e}",
-                                peer.pid
-                            ),
-                        }
-                    }
-                };
-                self.capture(path, &cwd, ttl_secs.unwrap_or(DEFAULT_TTL_SECS))
-            }
             Request::Clear { path } => self.clear(path, peer),
             Request::Status => Response::Status {
                 captures: self.state.lock().unwrap().info(),
             },
-            Request::Run { secrets, argv } => self.grant(secrets, argv),
+            Request::GrantAll { env } => self.grant_all(env, peer),
+            Request::Run {
+                env,
+                argv,
+                grant_all,
+            } => self.run(env, argv, grant_all, peer),
         }
     }
 
@@ -206,125 +197,221 @@ impl Daemon {
         });
         let n = self.state.lock().unwrap().clear(target.as_deref());
         Response::Ok {
-            message: format!("cleared {n} capture(s)"),
+            message: format!("cleared {n} grant(s)"),
         }
     }
 
-    /// Capture gate: resolve + canonicalize the path, ask the user, read it.
-    fn capture(&self, path: String, cwd: &Path, ttl_secs: u64) -> Response {
-        let resolved = match resolve(cwd, &path) {
-            Ok(p) => p,
-            Err(e) => {
-                return Response::Error {
-                    message: format!("cannot resolve {path}: {e}"),
-                }
-            }
-        };
-
-        let prompt = format!(
-            "Capture secrets from:\n  {}\nHold for {} minute(s).",
-            resolved.display(),
-            ttl_secs / 60
-        );
-        if !self.gate.approve(&prompt) {
-            return Response::Denied {
-                reason: "capture not approved".to_string(),
+    /// Pre-authorize files in allow-all mode (no command). Prompts once per
+    /// file to grant it for the window with the per-command prompt suppressed.
+    fn grant_all(&self, env: Vec<String>, peer: &Peer) -> Response {
+        if env.is_empty() {
+            return Response::Error {
+                message: "grant-all requires at least one --env <path>".to_string(),
             };
         }
-
-        let values = match parse_env(&resolved) {
-            Ok(v) => v,
+        let cwd = match peer.cwd() {
+            Ok(c) => c,
             Err(e) => {
                 return Response::Error {
-                    message: format!("reading {}: {e:#}", resolved.display()),
+                    message: format!("cannot determine caller cwd (pid {}): {e}", peer.pid),
                 }
             }
         };
-
-        let source = resolved.display().to_string();
-        let mut names: Vec<String> = values.keys().cloned().collect();
-        names.sort();
-        self.state
-            .lock()
-            .unwrap()
-            .add(source.clone(), values, Duration::from_secs(ttl_secs));
-
-        Response::Captured {
-            source,
-            names,
-            expires_in_secs: ttl_secs,
+        for path in &env {
+            let resolved = match resolve(&cwd, path) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Response::Error {
+                        message: format!("cannot resolve {path}: {e}"),
+                    }
+                }
+            };
+            let source = resolved.display().to_string();
+            if let Err(resp) = self.authorize(&source, &resolved, None, true) {
+                return resp;
+            }
+        }
+        Response::Ok {
+            message: format!("allow-all granted for {} file(s) (1h)", env.len()),
         }
     }
 
-    /// Per-use gate: resolve names from active captures and, if the user
-    /// approves *this command*, hand the values back to the client to inject.
-    ///
-    /// The daemon never spawns `argv` — it only displays it at the gate so the
-    /// user knows what the secret will be used for. Execution happens entirely
-    /// in the in-sandbox client, so the daemon is not an executor and cannot be
-    /// turned into a path out of the sandbox.
-    fn grant(&self, secrets: Vec<String>, argv: Vec<String>) -> Response {
+    /// Resolve each `.env`, run both gates, then return the merged values for
+    /// the client to inject and exec `argv`.
+    fn run(&self, env: Vec<String>, argv: Vec<String>, grant_all: bool, peer: &Peer) -> Response {
         if argv.is_empty() {
             return Response::Error {
                 message: "run requires a command".to_string(),
             };
         }
-
-        // Pre-check availability so we only prompt for a command we can serve.
-        if let Some(missing) = self.missing_secrets(&secrets) {
-            return Response::Denied {
-                reason: format!("no active capture provides: {}", missing.join(", ")),
+        if env.is_empty() {
+            return Response::Error {
+                message: "run requires at least one --env <path>".to_string(),
             };
         }
 
-        let prompt = format!(
-            "Agent requests secret(s): {}\nto run command:\n  {}",
-            if secrets.is_empty() {
-                "(none)".to_string()
-            } else {
-                secrets.join(", ")
-            },
-            argv.join(" ")
-        );
-        if !self.gate.approve(&prompt) {
-            return Response::Denied {
-                reason: "command not approved".to_string(),
-            };
-        }
-
-        // Re-resolve *after* approval: the gate can block for minutes, and a
-        // capture's TTL may have lapsed while the user was deciding. The values
-        // released must reflect state at approval time, not before the prompt.
-        let mut injected: Vec<(String, String)> = Vec::new();
-        let mut missing: Vec<String> = Vec::new();
-        {
-            let mut st = self.state.lock().unwrap();
-            for name in &secrets {
-                match st.lookup(name) {
-                    Some(v) => injected.push((name.clone(), v)),
-                    None => missing.push(name.clone()),
+        let cwd = match peer.cwd() {
+            Ok(c) => c,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("cannot determine caller cwd (pid {}): {e}", peer.pid),
                 }
             }
-        }
-        if !missing.is_empty() {
-            return Response::Denied {
-                reason: format!("capture expired during approval: {}", missing.join(", ")),
+        };
+
+        // Merge the values of every requested file, in order (later files win),
+        // running both gates per file along the way.
+        let mut merged: Vec<(String, String)> = Vec::new();
+        for path in &env {
+            let resolved = match resolve(&cwd, path) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Response::Error {
+                        message: format!("cannot resolve {path}: {e}"),
+                    }
+                }
             };
+            let source = resolved.display().to_string();
+
+            let values = match self.authorize(&source, &resolved, Some(&argv), grant_all) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            for (k, v) in values {
+                merged.retain(|(ek, _)| ek != &k);
+                merged.push((k, v));
+            }
         }
 
-        Response::Granted { secrets: injected }
+        Response::Granted { secrets: merged }
     }
 
-    /// Names not currently provided by any live capture, or `None` if all present.
-    fn missing_secrets(&self, names: &[String]) -> Option<Vec<String>> {
-        let mut st = self.state.lock().unwrap();
-        let missing: Vec<String> = names
-            .iter()
-            .filter(|n| st.lookup(n).is_none())
-            .cloned()
-            .collect();
-        (!missing.is_empty()).then_some(missing)
+    /// The two gates for one already-resolved `.env`.
+    ///
+    /// * **File grant** — if no live grant exists, prompt a 1h grant and read
+    ///   the file. `make_allow_all` decides whether the new grant is allow-all.
+    /// * **Per-command** — when the grant is *not* allow-all and `argv` is
+    ///   `Some`, prompt to approve this specific command. `make_allow_all`
+    ///   upgrades a live confirm-mode grant to allow-all (prompted) instead.
+    ///
+    /// `argv == None` means "pre-authorize only" (no command to confirm).
+    /// `Err(Response)` carries a denial/error to return verbatim.
+    fn authorize(
+        &self,
+        source: &str,
+        resolved: &Path,
+        argv: Option<&[String]>,
+        make_allow_all: bool,
+    ) -> Result<Vec<(String, String)>, Response> {
+        let live = self.state.lock().unwrap().live(source);
+
+        // First use of this file → file-grant gate (reads the file fresh).
+        let Some(live) = live else {
+            return self.establish_grant(source, resolved, argv, make_allow_all);
+        };
+
+        // Already allow-all, and not asked to change → no prompt.
+        if live.allow_all && !make_allow_all {
+            return Ok(live.values);
+        }
+
+        // Asked to upgrade a confirm-mode grant to allow-all.
+        if make_allow_all {
+            if !self.gate.approve(&allow_all_prompt(resolved)) {
+                return Err(Response::Denied {
+                    reason: format!("allow-all not approved for {source}"),
+                });
+            }
+            self.state
+                .lock()
+                .unwrap()
+                .set_allow_all(source, Duration::from_secs(GRANT_TTL_SECS));
+            return Ok(live.values);
+        }
+
+        // Confirm-mode grant + a command → per-command gate.
+        let argv = argv.expect("confirm-mode path always has a command");
+        if !self.gate.approve(&per_command_prompt(resolved, argv)) {
+            return Err(Response::Denied {
+                reason: "command not approved".to_string(),
+            });
+        }
+        // Re-resolve after approval: the grant may have expired at the prompt.
+        match self.state.lock().unwrap().live(source) {
+            Some(g) => Ok(g.values),
+            None => Err(Response::Denied {
+                reason: format!("grant for {source} expired during approval"),
+            }),
+        }
     }
+
+    /// First-use file grant: prompt, read the file, store it.
+    fn establish_grant(
+        &self,
+        source: &str,
+        resolved: &Path,
+        argv: Option<&[String]>,
+        allow_all: bool,
+    ) -> Result<Vec<(String, String)>, Response> {
+        let prompt = if allow_all {
+            allow_all_prompt(resolved)
+        } else {
+            first_run_prompt(resolved, argv)
+        };
+        if !self.gate.approve(&prompt) {
+            return Err(Response::Denied {
+                reason: format!("grant not approved for {source}"),
+            });
+        }
+
+        let values = match parse_env(resolved) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(Response::Error {
+                    message: format!("reading {source}: {e:#}"),
+                })
+            }
+        };
+
+        self.state.lock().unwrap().add(
+            source.to_string(),
+            values.clone(),
+            Duration::from_secs(GRANT_TTL_SECS),
+            allow_all,
+        );
+
+        let mut out: Vec<(String, String)> = values.into_iter().collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+}
+
+fn first_run_prompt(resolved: &Path, argv: Option<&[String]>) -> String {
+    let mut p = format!(
+        "Grant access to secrets in:\n  {}\nfor {} minutes.",
+        resolved.display(),
+        GRANT_TTL_SECS / 60
+    );
+    if let Some(argv) = argv {
+        p.push_str(&format!("\nThis command will run:\n  {}", argv.join(" ")));
+    }
+    p
+}
+
+fn per_command_prompt(resolved: &Path, argv: &[String]) -> String {
+    format!(
+        "Run command:\n  {}\nwith secrets from:\n  {}",
+        argv.join(" "),
+        resolved.display()
+    )
+}
+
+fn allow_all_prompt(resolved: &Path) -> String {
+    format!(
+        "Allow ALL commands to use secrets in:\n  {}\nfor {} minutes, without confirming each one.",
+        resolved.display(),
+        GRANT_TTL_SECS / 60
+    )
 }
 
 /// Resolve `path` relative to `cwd` and canonicalize it (file must exist).
