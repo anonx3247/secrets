@@ -90,7 +90,9 @@ sandbox — see "Trusting `sx`" below.
 - **`sx-proto`** — newline-delimited JSON wire types (`Request`/`Response`) and
   the agreed socket path (`$SX_SOCKET`, else `$HOME/.sx/sxd.sock`).
 - **`sxd`** — the daemon / secrets oracle. Reads `.env`, gates grants, holds
-  granted secrets in memory with a 1h TTL. Never executes a command.
+  granted secrets in memory with a 1h TTL. Never executes a command. Service
+  subcommands: `install` (register the LaunchAgent + run `setup`), `setup`
+  (resolve the `aws` CLI path into `~/.sx/config`), `uninstall`.
 - **`sx`** — the in-sandbox client. For `run`, it receives the granted values and
   execs the command itself, redacting the values from the child's output.
   Subcommands: `run` (`--env <path>`, `--aws-profile <name>`, `--grant-all`),
@@ -187,6 +189,21 @@ values are produced and in the subject shown at the human prompt.
   the daemon returns the captured stderr as a denial/error — it never folds that
   output into a successful grant. A single `sx run --env .env --aws-profile prod
   -- cmd` runs every gate and merges both sources' values.
+
+  **The `aws` CLI path is resolved once at setup, not searched at runtime.**
+  launchd starts `sxd` as a LaunchAgent with a minimal `$PATH`
+  (`/usr/bin:/bin:/usr/sbin:/sbin`), so a daemon-side `Command::new("aws")` can't
+  find `/usr/local/bin/aws` (or Homebrew's). Guessing extra PATH dirs is brittle.
+  Instead `sxd setup` (auto-run by `sxd install`) — which executes in the user's
+  real shell environment with the full `$PATH` — scans `$PATH` for an executable
+  `aws` and writes its absolute path to `~/.sx/config` under `aws_cli_path` (a
+  tiny `KEY=VALUE` file in the same `~/.sx` dir as the socket and log; reused
+  `dotenvy` parses it). `mint_aws` reads that key fresh on every mint and spawns
+  the stored absolute path verbatim — it NEVER searches `$PATH`. Reading fresh
+  means a freshly-written config takes effect on the next mint with no launchd
+  reload. A missing/unset key, or a configured path that's gone/non-executable,
+  returns a `Response::Error` telling the user to run `sxd setup`. `$SX_AWS_PATH`
+  overrides the config (for tests/CI) but never re-enables a bare PATH search.
 - **OS keychain (planned).** Via the `keyring` crate (macOS Keychain, Linux
   Secret Service, Windows Credential Manager). Adds encryption at rest and, on
   macOS, a hardware-backed `kSecAccessControl`/TouchID gate on the item itself.

@@ -16,6 +16,7 @@
 //!     (unsandboxed) context. Production must re-apply the agent's sandbox to
 //!     the child so `run` is not an escape hatch.
 
+mod config;
 mod gate;
 mod peer;
 mod service;
@@ -48,7 +49,30 @@ fn main() -> Result<()> {
     match raw.first().map(String::as_str) {
         Some("install") => {
             let dry_run = raw.iter().any(|a| a == "--print" || a == "--dry-run");
-            return service::install(dry_run).map_err(Into::into);
+            service::install(dry_run)?;
+            // A single `sxd install` should leave the daemon fully ready, so
+            // also resolve + persist the aws CLI path here (this runs with the
+            // user's real shell PATH). Discovery failure is non-fatal: warn and
+            // point at `sxd setup` rather than aborting the service install.
+            if !dry_run {
+                match store_aws_cli_path() {
+                    Ok(Some(path)) => {
+                        println!("Resolved aws CLI: {}", path.display());
+                    }
+                    Ok(None) => eprintln!(
+                        "warning: could not find the `aws` CLI on PATH; AWS minting will not \
+                         work until you install it and run `sxd setup`."
+                    ),
+                    Err(e) => eprintln!(
+                        "warning: failed to record the aws CLI path ({e}); run `sxd setup`."
+                    ),
+                }
+            }
+            return Ok(());
+        }
+        Some("setup") => {
+            let dry_run = raw.iter().any(|a| a == "--print" || a == "--dry-run");
+            return cmd_setup(dry_run);
         }
         Some("uninstall") => return service::uninstall().map_err(Into::into),
         _ => {}
@@ -68,7 +92,8 @@ fn main() -> Result<()> {
             "-h" | "--help" => {
                 println!(
                     "usage: sxd [--socket PATH] [--cli-gate] [--no-gate]\n       \
-                     sxd install [--print]   # register a login auto-start agent (macOS)\n       \
+                     sxd install [--print]   # register a login auto-start agent (macOS); also runs setup\n       \
+                     sxd setup [--print]     # resolve the aws CLI path and store it in ~/.sx/config\n       \
                      sxd uninstall"
                 );
                 return Ok(());
@@ -105,6 +130,61 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Discover the `aws` CLI on the current PATH and persist its absolute path to
+/// `~/.sx/config` under `aws_cli_path`. Returns the resolved path, or `None`
+/// when `aws` could not be found anywhere. Shared by `sxd install` and
+/// `sxd setup` so both leave identical config behind.
+fn store_aws_cli_path() -> Result<Option<PathBuf>> {
+    match config::discover_aws_cli() {
+        Some(path) => {
+            config::set(config::AWS_CLI_PATH, &path.to_string_lossy())
+                .context("writing ~/.sx/config")?;
+            Ok(Some(path))
+        }
+        None => Ok(None),
+    }
+}
+
+/// `sxd setup`: resolve the `aws` CLI in the user's real shell environment and
+/// store it in `~/.sx/config`, so the daemon — which launchd starts with a
+/// minimal PATH — can spawn it by absolute path without ever searching PATH.
+///
+/// With `--print`/`--dry-run`, report what would be written without touching
+/// the config file. A missing `aws` is a hard error here (unlike during
+/// `install`), telling the user how to fix it.
+fn cmd_setup(dry_run: bool) -> Result<()> {
+    let cfg = config::config_path()?;
+    match config::discover_aws_cli() {
+        Some(path) => {
+            if dry_run {
+                println!(
+                    "# would write {}={} to {}",
+                    config::AWS_CLI_PATH,
+                    path.display(),
+                    cfg.display()
+                );
+            } else {
+                config::set(config::AWS_CLI_PATH, &path.to_string_lossy())
+                    .context("writing ~/.sx/config")?;
+                println!("Found aws CLI: {}", path.display());
+                println!(
+                    "Saved {}={} to {}",
+                    config::AWS_CLI_PATH,
+                    path.display(),
+                    cfg.display()
+                );
+            }
+            Ok(())
+        }
+        None => anyhow::bail!(
+            "could not find the `aws` CLI on your PATH. Install the AWS CLI \
+             (https://aws.amazon.com/cli/), or set `{}=<absolute path>` manually in {}.",
+            config::AWS_CLI_PATH,
+            cfg.display()
+        ),
+    }
 }
 
 /// The gate used unless overridden by a flag: TouchID on macOS (falling back
@@ -537,6 +617,51 @@ fn parse_env(path: &Path) -> Result<HashMap<String, String>> {
     Ok(map)
 }
 
+/// Environment override for the configured `aws` CLI path, taking precedence
+/// over `~/.sx/config`. Handy for tests/CI. Even with this set, the daemon
+/// still NEVER does a bare `$PATH` search for `aws`.
+const AWS_PATH_ENV: &str = "SX_AWS_PATH";
+
+/// Resolve the absolute path to the `aws` CLI the daemon must spawn — WITHOUT
+/// searching `$PATH`.
+///
+/// The path comes from `$SX_AWS_PATH` if set, otherwise from `aws_cli_path` in
+/// `~/.sx/config` (written by `sxd setup` / `sxd install`). Read fresh on every
+/// mint so a freshly-written config is picked up by an already-running daemon
+/// with no launchd reload. Every failure path returns a `Response` for the
+/// client, never folding error text into a grant.
+fn resolve_aws_cli() -> Result<PathBuf, Response> {
+    let configured = match std::env::var_os(AWS_PATH_ENV) {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => match config::get(config::AWS_CLI_PATH) {
+            Ok(Some(p)) => PathBuf::from(p),
+            Ok(None) => {
+                return Err(Response::Error {
+                    message: "AWS CLI path is not configured; run `sxd setup` \
+                              (or `sxd install`) to record it in ~/.sx/config."
+                        .to_string(),
+                })
+            }
+            Err(e) => {
+                return Err(Response::Error {
+                    message: format!("cannot read ~/.sx/config: {e}; run `sxd setup`."),
+                })
+            }
+        },
+    };
+
+    if !config::is_executable_file(&configured) {
+        return Err(Response::Error {
+            message: format!(
+                "configured aws CLI path {} does not exist or isn't executable; \
+                 re-run `sxd setup` (the CLI may have moved).",
+                configured.display()
+            ),
+        });
+    }
+    Ok(configured)
+}
+
 /// Mint temporary AWS credentials for `profile` by shelling out to the AWS CLI.
 ///
 /// Runs `aws configure export-credentials --profile <profile> --format
@@ -550,8 +675,16 @@ fn parse_env(path: &Path) -> Result<HashMap<String, String>> {
 /// CLI, non-zero exit) this returns a `Response` carrying the CLI's stderr so
 /// the caller surfaces it as a denial/error — the stderr is NEVER folded into a
 /// successful grant.
+///
+/// Crucially, the daemon spawns `aws` by the **absolute path resolved at setup
+/// time** (see [`resolve_aws_cli`]), never by searching `$PATH`. launchd starts
+/// `sxd` with a minimal `$PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`), so a bare
+/// `Command::new("aws")` would fail to find `/usr/local/bin/aws`. The config is
+/// read fresh on every mint, so writing it via `sxd setup` takes effect on the
+/// next mint with no launchd reload.
 fn mint_aws(profile: &str) -> Result<HashMap<String, String>, Response> {
-    let output = match Command::new("aws")
+    let aws = resolve_aws_cli()?;
+    let output = match Command::new(&aws)
         .args([
             "configure",
             "export-credentials",
@@ -566,8 +699,9 @@ fn mint_aws(profile: &str) -> Result<HashMap<String, String>, Response> {
         Err(e) => {
             return Err(Response::Error {
                 message: format!(
-                    "cannot run `aws` to mint credentials for profile {profile}: {e} \
-                     (is the AWS CLI installed and on PATH?)"
+                    "cannot run `{}` to mint credentials for profile {profile}: {e} \
+                     (re-run `sxd setup` — the AWS CLI may have moved)",
+                    aws.display()
                 ),
             })
         }

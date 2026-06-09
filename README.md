@@ -29,10 +29,21 @@ not a LaunchDaemon, because `sxd` shows TouchID prompts — those only work insi
 your GUI session, and the daemon must run as you for the peer-credential check.
 
 ```sh
-sxd install            # register + start the agent (also: --print for a dry run)
+sxd install            # register + start the agent, AND record the aws CLI path (--print: dry run)
+sxd setup              # just (re-)record the aws CLI path in ~/.sx/config (--print: dry run)
 sxd uninstall          # stop + remove it
 launchctl print gui/$(id -u)/dev.sx.sxd   # inspect; log at ~/.sx/sxd.log
 ```
+
+**AWS minting needs the `aws` CLI path resolved once at setup.** launchd starts
+`sxd` with a minimal `$PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`), so the daemon
+can't find `/usr/local/bin/aws` (or Homebrew's) by searching `$PATH`. `sxd
+setup` — run automatically by `sxd install` — resolves the `aws` executable's
+absolute path in *your* shell `$PATH` and stores it in `~/.sx/config` as
+`aws_cli_path`. The daemon then spawns that absolute path verbatim, never
+searching `$PATH`. The config is read fresh on every mint, so after a rebuild +
+`sxd setup` (or `sxd install`) the already-running daemon works on the next mint
+with no `launchctl` reload. (`$SX_AWS_PATH` overrides the config for tests/CI.)
 
 Linux/Windows auto-start isn't wired up yet (a headless service can't present the
 approval prompt); run `sxd` manually there for now.
