@@ -51,12 +51,17 @@ impl State {
         before - self.captures.len()
     }
 
-    /// Look up a secret by name across all active captures.
-    pub fn lookup(&mut self, name: &str) -> Option<String> {
+    /// Return the values of a still-live grant for `source`, or `None` if it is
+    /// not granted (or its TTL has elapsed). Used to skip re-prompting within
+    /// the grant window.
+    pub fn live_values(&mut self, source: &str) -> Option<Vec<(String, String)>> {
         self.purge_expired();
-        self.captures
-            .iter()
-            .find_map(|c| c.values.get(name).cloned())
+        self.captures.iter().find(|c| c.source == source).map(|c| {
+            c.values
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
     }
 
     /// Snapshot of active captures, safe to hand to the agent (names only).

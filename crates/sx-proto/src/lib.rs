@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 /// Environment variable that overrides the default socket path.
 pub const SOCKET_ENV: &str = "SX_SOCKET";
 
-/// Default capture lifetime if the client does not specify one.
-pub const DEFAULT_TTL_SECS: u64 = 3600;
+/// Lifetime of a grant: how long a `.env` stays usable after its first run
+/// before the next run re-prompts. One hour.
+pub const GRANT_TTL_SECS: u64 = 3600;
 
 /// Resolve the unix socket path both halves agree on.
 ///
@@ -33,35 +34,25 @@ pub fn socket_path() -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
-    /// Capture the secrets defined in a `.env` file into the daemon.
-    ///
-    /// This is the time-boxed outer envelope ("capture security"): it is
-    /// TouchID-gated and the captured values live only in daemon memory until
-    /// `ttl_secs` elapses or they are explicitly cleared. The client never
-    /// reads the file — `path` is resolved by the daemon relative to the
-    /// caller's *verified* cwd (derived from the peer pid, not sent here).
-    Capture {
-        path: String,
-        ttl_secs: Option<u64>,
-    },
-
-    /// Drop captured secrets — a single source path, or all of them.
+    /// Drop granted `.env` files — a single source path, or all of them.
     Clear { path: Option<String> },
 
-    /// Report active captures and the secret names they expose (never values).
+    /// Report active grants and the secret names they expose (never values).
     Status,
 
-    /// Request the named secrets in order to run `argv`.
+    /// Request the secrets from one or more `.env` files in order to run `argv`.
     ///
-    /// The daemon does NOT execute anything — it resolves the names against
-    /// active captures, gates on the shown command, and (if approved) returns
-    /// the values to the caller via [`Response::Granted`]. The client (`sx`),
-    /// which lives inside the sandbox, then injects them and execs `argv`
-    /// itself, so the child inherits the client's confinement and the daemon
-    /// is never an executor. `argv` is sent so the daemon can show it at the
-    /// gate; the daemon does not run it.
+    /// The daemon does NOT execute anything. For each `env` path it resolves
+    /// the file against the caller's *verified* cwd (derived from the peer pid,
+    /// not sent here); on the first use of a path it gates a time-boxed grant
+    /// (TouchID), and caches it so later runs within the window don't re-prompt.
+    /// It then returns the merged values via [`Response::Granted`]. The client
+    /// (`sx`), inside the sandbox, injects them and execs `argv` itself, so the
+    /// child inherits the client's confinement and the daemon is never an
+    /// executor. `argv` is sent only so the daemon can show it at the grant
+    /// prompt; the daemon does not run it.
     Run {
-        secrets: Vec<String>,
+        env: Vec<String>,
         argv: Vec<String>,
     },
 }
@@ -72,13 +63,6 @@ pub enum Request {
 pub enum Response {
     /// Generic success with a human-readable message.
     Ok { message: String },
-
-    /// A capture succeeded; reports the names made available (no values).
-    Captured {
-        source: String,
-        names: Vec<String>,
-        expires_in_secs: u64,
-    },
 
     /// Current daemon state.
     Status { captures: Vec<CaptureInfo> },

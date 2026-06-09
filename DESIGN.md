@@ -25,8 +25,8 @@ with arbitrary code execution from exfiltrating a secret it has been allowed to
 use. What we *do* provide:
 
 1. The secret value never enters the agent's own process or context.
-2. Reading a secret store and using a secret are **gated by a human** — once at
-   capture time and again at each use.
+2. Access to a secret store is **gated by a human** — a TouchID grant, per
+   `.env` file, on first use, lasting one hour.
 3. Casual/accidental leakage (secrets in transcripts, logs, echoed output) is
    blocked by redaction.
 
@@ -39,8 +39,10 @@ deployment concern, layered on top — not something this tool can do alone.
 - **Primary: the careless agent.** Keep secrets out of the LLM transcript, logs,
   scrollback, and disk locations a sandbox can't protect. Fully addressed.
 - **Secondary: casual exfiltration.** `printenv`, echoed secrets, obvious
-  `curl` to an attacker. Addressed by the per-use approval prompt (the human
-  sees the command) plus output redaction.
+  `curl` to an attacker. Partially addressed: the human sees the file and the
+  first command at grant time, and output redaction scrubs echoes — but within
+  the 1h grant window subsequent commands run unprompted, so this leans on
+  redaction (and egress restriction) more than on the human.
 - **Out of scope alone: a determined malicious agent** that launders the secret
   through an approved-but-trojaned command (e.g. an agent-authored `deploy.sh`).
   Mitigated only when combined with network egress control.
@@ -85,11 +87,11 @@ sandbox — see "Trusting `sx`" below.
 
 - **`sx-proto`** — newline-delimited JSON wire types (`Request`/`Response`) and
   the agreed socket path (`$SX_SOCKET`, else `$HOME/.sx/sxd.sock`).
-- **`sxd`** — the daemon / secrets oracle. Reads `.env`, gates, holds captured
-  secrets in memory with a TTL. Never executes a command.
-- **`sx`** — the in-sandbox client. For `run`, it receives the gated values and
+- **`sxd`** — the daemon / secrets oracle. Reads `.env`, gates grants, holds
+  granted secrets in memory with a 1h TTL. Never executes a command.
+- **`sx`** — the in-sandbox client. For `run`, it receives the granted values and
   execs the command itself, redacting the values from the child's output.
-  Subcommands: `capture`, `clear`, `status`/`list`, `run`.
+  Subcommands: `run` (`--env <path>`), `clear`, `status`/`list`.
 
 ## Trusting `sx`
 
@@ -106,41 +108,43 @@ to be **enforced**, not assumed (tracked, not yet implemented):
 - **Hardened runtime, no `get-task-allow`.** Built this way, other same-uid
   processes cannot attach to `sx` or read its memory.
 
-Until both land, the per-use command binding is only as strong as the agent's
-honesty: a same-uid impostor could request a secret under a benign-looking
-command. The careless-agent and casual-exfil guarantees still hold.
+Until both land, the grant binding is only as strong as the agent's honesty: a
+same-uid impostor could obtain values once a grant is live. The careless-agent
+and casual-exfil guarantees still hold.
 
-## The double gate
+## The grant gate
 
-Two independent human checkpoints, both required:
+A single human checkpoint, per `.env` file, time-boxed:
 
-1. **Capture gate (the outer, time-boxed envelope).**
-   `sx capture <path> [--ttl N]` asks the daemon to read a `.env`. The daemon
-   resolves the path (relative to the caller's cwd), **canonicalizes it**, shows
-   the absolute path, and asks the user (TouchID). On approval the values are
-   loaded into daemon memory with a TTL. This bounds *which* secrets are live and
-   *for how long*.
+`sx run --env <path> -- cmd …` resolves `<path>` against the caller's verified
+cwd and **canonicalizes it**. On the **first use** of that canonical path the
+daemon shows it (plus the command that triggered it) and asks the user (TouchID)
+to grant access for **one hour**. On approval the file's values are read into
+daemon memory with a 1h TTL. Every later `sx run --env <same path>` within the
+window reuses the grant **without prompting**; after it expires, the next run
+re-prompts. `--env` must be passed on every call (no ambient session state), and
+`sx clear <path>` revokes a grant early.
 
-2. **Per-use gate (the inner check).**
-   Each `sx run -s NAME -- cmd …` prompts the user with the secret name(s) and
-   the full command before the daemon *releases* the value to `sx`. A capture
-   being live does **not** grant silent use — every use is confirmed.
-
-This is deliberately stricter than `sudo`'s timestamp model: capture is an
-*added* envelope, not a replacement for per-use confirmation. (The two could be
-relaxed independently per secret later — e.g. confirm-each-use for prod tokens,
-or a remembered approval keyed on `(secret, argv)` for noisy dev loops.)
+This is the `sudo`-timestamp / `aws-vault` ergonomic model: approve a source
+once, use it freely for a bounded window. The deliberate trade vs. a per-command
+prompt: **within the hour, any command the agent runs against a granted file is
+unprompted** — redaction and (eventually) network-egress restriction are the
+only backstops then, not a human. A per-command `--confirm` mode could be added
+for high-sensitivity files.
 
 ## How a secret is used
 
 ```
-sx run -s GITHUB_TOKEN -- gh pr create --title "..."
+sx run --env .env -- gh pr create --title "..."
 ```
 
-1. `sx` sends `{secrets:[GITHUB_TOKEN], argv:[gh, pr, create, …]}`.
-2. Daemon resolves every name against live captures; unknown name → `Denied`.
-3. Daemon prompts the user with names + full command; refusal → `Denied`.
-4. Daemon returns `Granted{secrets}` — the values — to `sx`. It spawns nothing.
+1. `sx` sends `{env:[".env"], argv:[gh, pr, create, …]}`.
+2. Daemon derives the caller's cwd (verified peer pid), resolves + canonicalizes
+   each `--env` path.
+3. For each path: if a live grant exists, reuse it; otherwise prompt the 1h
+   grant (showing path + command), refusal → `Denied`, then read the file.
+4. Daemon returns `Granted{secrets}` — the merged values — to `sx`. It spawns
+   nothing.
 5. `sx` injects the values and execs `gh …` as **its own child**, in `sx`'s cwd,
    inside the sandbox.
 6. `sx` captures the child's stdout/stderr, **redacts** every injected value, and
@@ -148,7 +152,7 @@ sx run -s GITHUB_TOKEN -- gh pr create --title "..."
 
 ## Backends
 
-- **`.env` (today).** Frictionless: drop a file in a project dir, capture it.
+- **`.env` (today).** Frictionless: point `--env` at a file in any project dir.
   Plaintext at rest — security rests on the daemon being outside the sandbox.
 - **OS keychain (planned).** Via the `keyring` crate (macOS Keychain, Linux
   Secret Service, Windows Credential Manager). Adds encryption at rest and, on
@@ -183,8 +187,7 @@ an arbitrary `.env` or run a child in a directory it doesn't actually occupy.
 
 ## Approval gates (implemented)
 
-The gate is an `ApprovalGate` trait so the two checkpoints (capture and
-per-use) share one implementation:
+The grant gate is an `ApprovalGate` trait with three implementations:
 
 - **`TouchIdGate` (default on macOS).** Presents the system authentication
   sheet via LocalAuthentication (`LAPolicyDeviceOwnerAuthentication` — TouchID,
@@ -200,9 +203,12 @@ per-use) share one implementation:
 - **`sx` identity is not yet attested.** The plaintext is released to whatever
   same-uid process connects; until audit-token code-sign attestation lands, an
   impostor `sx` could obtain it (see "Trusting `sx`").
-- **No per-session capture scoping yet.** Peer auth restricts callers to the
-  owning uid, but any process of that uid can use a live capture. Captures
-  should additionally be scoped to the session that created them.
+- **No per-command confirmation.** A grant authorizes a `.env` for an hour;
+  every command in that window runs unprompted. An opt-in `--confirm` mode
+  (TouchID per command for high-sensitivity files) is a possible addition.
+- **No per-session grant scoping yet.** Peer auth restricts callers to the
+  owning uid, but any process of that uid can use a live grant. Grants should
+  additionally be scoped to the session that created them.
 - **Fully-interactive commands aren't supported.** `sx run` inherits stdin (so
   piped/redirected input works), but buffers stdout/stderr until the child exits
   so the values can be redacted. A command that must display output *before*
@@ -216,6 +222,6 @@ per-use) share one implementation:
 3. ~~Move execution into the sandboxed client (kill the daemon-as-executor
    escape hatch).~~ **Done.**
 4. Attest `sx`'s identity: audit-token code-sign check + hardened runtime.
-5. Per-session capture scoping.
+5. Per-session grant scoping.
 6. Keychain backend.
 7. Streaming output with incremental redaction.

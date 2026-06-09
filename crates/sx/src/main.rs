@@ -30,30 +30,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Capture the secrets in a .env file (TouchID-gated, time-boxed).
-    Capture {
-        /// Path to the .env file (resolved by the daemon, relative to cwd).
-        path: String,
-        /// How long the capture stays live, in minutes.
-        #[arg(long, default_value_t = 60)]
-        ttl: u64,
-    },
-    /// Drop captured secrets — a single source path, or all of them.
+    /// Drop granted .env files — a single source path, or all of them.
     Clear {
         /// Source path to clear; omit to clear everything.
         path: Option<String>,
     },
-    /// Show active captures and the secret names they expose (never values).
+    /// Show active grants and the secret names they expose (never values).
     Status,
     /// Alias for `status`, framed as "what secrets can I use right now".
     List,
-    /// Run a command with named secrets injected into the child only.
+    /// Run a command with the secrets from one or more .env files injected.
     ///
-    /// Example: sx run -s GITHUB_TOKEN -- gh pr create
+    /// The first use of a given .env prompts for a 1-hour grant; later runs
+    /// within the window reuse it without prompting. The path must be given
+    /// each call.
+    ///
+    /// Example: sx run --env .env -- gh pr create
     Run {
-        /// Secret name to inject (repeatable).
-        #[arg(short = 's', long = "secret")]
-        secrets: Vec<String>,
+        /// Path to a .env file whose secrets to inject (repeatable, required).
+        #[arg(long = "env", required = true)]
+        env: Vec<String>,
         /// The command and its arguments, after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
@@ -77,26 +73,21 @@ fn run() -> Result<ExitCode> {
     // so the child stays inside our sandbox. Everything else is a simple
     // request/response we just render.
     //
-    // Note: we deliberately do NOT send our cwd. For `capture`, the daemon
-    // derives the caller's working directory from the verified peer pid, so a
-    // compromised client cannot point it at an arbitrary `.env`. For `run`, the
-    // child simply inherits our own cwd.
+    // Note: we deliberately do NOT send our cwd. The daemon derives the caller's
+    // working directory from the verified peer pid to resolve the --env paths,
+    // so a compromised client cannot fake where the files live.
     match cli.command {
-        Cmd::Run { secrets, argv } => exec_with_secrets(secrets, argv),
-        Cmd::Capture { path, ttl } => Ok(render(send(&Request::Capture {
-            path,
-            ttl_secs: Some(ttl * 60),
-        })?)),
+        Cmd::Run { env, argv } => exec_with_secrets(env, argv),
         Cmd::Clear { path } => Ok(render(send(&Request::Clear { path })?)),
         Cmd::Status | Cmd::List => Ok(render(send(&Request::Status)?)),
     }
 }
 
-/// Ask the daemon (gated) for the named secrets, then inject and exec `argv`
+/// Ask the daemon (gated) for the secrets in `env`, then inject and exec `argv`
 /// as our own child, redacting the secret values from its output.
-fn exec_with_secrets(secrets: Vec<String>, argv: Vec<String>) -> Result<ExitCode> {
+fn exec_with_secrets(env: Vec<String>, argv: Vec<String>) -> Result<ExitCode> {
     let response = send(&Request::Run {
-        secrets,
+        env,
         argv: argv.clone(),
     })?;
 
@@ -176,24 +167,9 @@ fn render(response: Response) -> ExitCode {
             println!("{message}");
             ExitCode::SUCCESS
         }
-        Response::Captured {
-            source,
-            names,
-            expires_in_secs,
-        } => {
-            println!(
-                "captured {} secret(s) from {source} (expires in {}m):",
-                names.len(),
-                expires_in_secs / 60
-            );
-            for n in names {
-                println!("  {n}");
-            }
-            ExitCode::SUCCESS
-        }
         Response::Status { captures } => {
             if captures.is_empty() {
-                println!("no active captures");
+                println!("no active grants");
             } else {
                 for c in captures {
                     println!("{} (expires in {}m)", c.source, c.expires_in_secs / 60);
