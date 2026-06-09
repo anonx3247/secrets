@@ -236,7 +236,7 @@ impl Daemon {
                     .to_string(),
             };
         }
-        let sources = match self.build_sources(&env, &aws_profiles, peer) {
+        let sources = match build_sources(&env, &aws_profiles, peer) {
             Ok(s) => s,
             Err(resp) => return resp,
         };
@@ -273,7 +273,7 @@ impl Daemon {
             };
         }
 
-        let sources = match self.build_sources(&env, &aws_profiles, peer) {
+        let sources = match build_sources(&env, &aws_profiles, peer) {
             Ok(s) => s,
             Err(resp) => return resp,
         };
@@ -293,53 +293,6 @@ impl Daemon {
         }
 
         Response::Granted { secrets: merged }
-    }
-
-    /// Turn the client's `--env` paths and `--aws-profile` names into resolved
-    /// [`Source`]s, preserving order (env first, then AWS).
-    ///
-    /// The caller's verified cwd is only derived when there is at least one
-    /// `.env` path to resolve, so an AWS-only request never fails on a
-    /// transient `proc_pidinfo` hiccup. AWS profiles are NOT touched by
-    /// filesystem resolution — they are keyed under a synthetic `aws:<profile>`.
-    fn build_sources(
-        &self,
-        env: &[String],
-        aws_profiles: &[String],
-        peer: &Peer,
-    ) -> Result<Vec<Source>, Response> {
-        let mut sources = Vec::with_capacity(env.len() + aws_profiles.len());
-        if !env.is_empty() {
-            let cwd = match peer.cwd() {
-                Ok(c) => c,
-                Err(e) => {
-                    return Err(Response::Error {
-                        message: format!("cannot determine caller cwd (pid {}): {e}", peer.pid),
-                    })
-                }
-            };
-            for path in env {
-                let resolved = match resolve(&cwd, path) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return Err(Response::Error {
-                            message: format!("cannot resolve {path}: {e}"),
-                        })
-                    }
-                };
-                sources.push(Source::Env {
-                    key: resolved.display().to_string(),
-                    path: resolved,
-                });
-            }
-        }
-        for profile in aws_profiles {
-            sources.push(Source::Aws {
-                key: format!("{AWS_SOURCE_PREFIX}{profile}"),
-                profile: profile.clone(),
-            });
-        }
-        Ok(sources)
     }
 
     /// The two gates for one already-resolved source.
@@ -515,6 +468,52 @@ fn allow_all_prompt(src: &Source) -> String {
         src.subject(),
         GRANT_TTL_SECS / 60
     )
+}
+
+/// Turn the client's `--env` paths and `--aws-profile` names into resolved
+/// [`Source`]s, preserving order (env first, then AWS).
+///
+/// The caller's verified cwd is only derived when there is at least one `.env`
+/// path to resolve, so an AWS-only request never fails on a transient
+/// `proc_pidinfo` hiccup. AWS profiles are NOT touched by filesystem
+/// resolution — they are keyed under a synthetic `aws:<profile>`.
+fn build_sources(
+    env: &[String],
+    aws_profiles: &[String],
+    peer: &Peer,
+) -> Result<Vec<Source>, Response> {
+    let mut sources = Vec::with_capacity(env.len() + aws_profiles.len());
+    if !env.is_empty() {
+        let cwd = match peer.cwd() {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(Response::Error {
+                    message: format!("cannot determine caller cwd (pid {}): {e}", peer.pid),
+                })
+            }
+        };
+        for path in env {
+            let resolved = match resolve(&cwd, path) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Err(Response::Error {
+                        message: format!("cannot resolve {path}: {e}"),
+                    })
+                }
+            };
+            sources.push(Source::Env {
+                key: resolved.display().to_string(),
+                path: resolved,
+            });
+        }
+    }
+    for profile in aws_profiles {
+        sources.push(Source::Aws {
+            key: format!("{AWS_SOURCE_PREFIX}{profile}"),
+            profile: profile.clone(),
+        });
+    }
+    Ok(sources)
 }
 
 /// Resolve `path` relative to `cwd` and canonicalize it (file must exist).
