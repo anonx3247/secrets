@@ -32,10 +32,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Drop granted .env files — a single source path, or all of them.
+    /// Drop granted sources — a single source, or all of them.
+    ///
+    /// Pass a `.env` path positionally, or `--aws-profile <name>` to revoke a
+    /// single AWS-profile grant. With no argument, clears everything.
     Clear {
         /// Source path to clear; omit to clear everything.
         path: Option<String>,
+        /// AWS profile to clear (maps to the `aws:<profile>` grant).
+        #[arg(long = "aws-profile", conflicts_with = "path")]
+        aws_profile: Option<String>,
     },
     /// Show active grants and the secret names they expose (never values).
     Status,
@@ -51,23 +57,30 @@ enum Cmd {
     ///
     /// Example: sx grant-all --env .env
     GrantAll {
-        /// Path to a .env file to allow-all (repeatable, required).
-        #[arg(long = "env", required = true)]
+        /// Path to a .env file to allow-all (repeatable).
+        #[arg(long = "env")]
         env: Vec<String>,
+        /// AWS profile to allow-all (repeatable).
+        #[arg(long = "aws-profile")]
+        aws_profile: Vec<String>,
     },
-    /// Run a command with the secrets from one or more .env files injected.
+    /// Run a command with the secrets from one or more sources injected.
     ///
-    /// The first use of a given .env prompts for a 1-hour grant; by default
-    /// every command is then confirmed individually. Pass --grant-all to opt
-    /// the file(s) out of per-command confirmation for the window. The path
-    /// must be given each call.
+    /// Sources are `.env` files (`--env`) and/or AWS profiles (`--aws-profile`);
+    /// at least one of either is required. The first use of a given source
+    /// prompts for a 1-hour grant; by default every command is then confirmed
+    /// individually. Pass --grant-all to opt the source(s) out of per-command
+    /// confirmation for the window. The source(s) must be given each call.
     ///
-    /// Example: sx run --env .env -- gh pr create
+    /// Example: sx run --env .env --aws-profile prod -- gh pr create
     Run {
-        /// Path to a .env file whose secrets to inject (repeatable, required).
-        #[arg(long = "env", required = true)]
+        /// Path to a .env file whose secrets to inject (repeatable).
+        #[arg(long = "env")]
         env: Vec<String>,
-        /// Skip per-command confirmation for these file(s) for the grant window.
+        /// AWS profile to mint temporary credentials from (repeatable).
+        #[arg(long = "aws-profile")]
+        aws_profile: Vec<String>,
+        /// Skip per-command confirmation for these source(s) for the grant window.
         #[arg(long = "grant-all")]
         grant_all: bool,
         /// The command and its arguments, after `--`.
@@ -127,11 +140,32 @@ fn run() -> Result<ExitCode> {
     match cli.command {
         Cmd::Run {
             env,
+            aws_profile,
             grant_all,
             argv,
-        } => exec_with_secrets(env, argv, grant_all),
-        Cmd::GrantAll { env } => Ok(render(send(&Request::GrantAll { env })?)),
-        Cmd::Clear { path } => Ok(render(send(&Request::Clear { path })?)),
+        } => {
+            if env.is_empty() && aws_profile.is_empty() {
+                anyhow::bail!("run requires at least one --env <path> or --aws-profile <profile>");
+            }
+            exec_with_secrets(env, aws_profile, argv, grant_all)
+        }
+        Cmd::GrantAll { env, aws_profile } => {
+            if env.is_empty() && aws_profile.is_empty() {
+                anyhow::bail!(
+                    "grant-all requires at least one --env <path> or --aws-profile <profile>"
+                );
+            }
+            Ok(render(send(&Request::GrantAll {
+                env,
+                aws_profiles: aws_profile,
+            })?))
+        }
+        Cmd::Clear { path, aws_profile } => {
+            // `--aws-profile p` clears the synthetic `aws:p` grant; a positional
+            // path clears that source; neither clears everything.
+            let path = aws_profile.map(|p| format!("aws:{p}")).or(path);
+            Ok(render(send(&Request::Clear { path })?))
+        }
         Cmd::Status | Cmd::List => Ok(render(send(&Request::Status)?)),
         Cmd::Skill { action } => run_skill(action),
     }
@@ -153,11 +187,18 @@ fn run_skill(action: SkillAction) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Ask the daemon (gated) for the secrets in `env`, then inject and exec `argv`
-/// as our own child, redacting the secret values from its output.
-fn exec_with_secrets(env: Vec<String>, argv: Vec<String>, grant_all: bool) -> Result<ExitCode> {
+/// Ask the daemon (gated) for the secrets from `env` files and `aws_profiles`,
+/// then inject and exec `argv` as our own child, redacting the secret values
+/// from its output.
+fn exec_with_secrets(
+    env: Vec<String>,
+    aws_profiles: Vec<String>,
+    argv: Vec<String>,
+    grant_all: bool,
+) -> Result<ExitCode> {
     let response = send(&Request::Run {
         env,
+        aws_profiles,
         argv: argv.clone(),
         grant_all,
     })?;
