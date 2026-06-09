@@ -9,6 +9,8 @@
 //! by the daemon) to use the values only to launch the requested command and
 //! to redact them from that command's output.
 
+mod skill;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::process::{Command, ExitCode, Stdio};
@@ -39,6 +41,11 @@ enum Cmd {
     Status,
     /// Alias for `status`, framed as "what secrets can I use right now".
     List,
+    /// Install or remove the sx usage skill for AI coding agents.
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
     /// Grant a .env file for 1h AND allow all its commands without per-command
     /// prompts. Runs nothing — use this to opt a file out of confirmation.
     ///
@@ -66,6 +73,34 @@ enum Cmd {
         /// The command and its arguments, after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillAction {
+    /// Write the skill into agent config dirs. With no target flag, all three.
+    Install {
+        /// Install for Claude Code (~/.claude/skills/sx).
+        #[arg(long)]
+        claude: bool,
+        /// Install for Codex (managed block in ~/.codex/AGENTS.md).
+        #[arg(long)]
+        codex: bool,
+        /// Install for Pi (~/.pi/agent/skills/sx).
+        #[arg(long)]
+        pi: bool,
+        /// Print what would change without writing anything.
+        #[arg(long)]
+        print: bool,
+    },
+    /// Remove the installed skill. With no target flag, all three.
+    Uninstall {
+        #[arg(long)]
+        claude: bool,
+        #[arg(long)]
+        codex: bool,
+        #[arg(long)]
+        pi: bool,
     },
 }
 
@@ -98,7 +133,24 @@ fn run() -> Result<ExitCode> {
         Cmd::GrantAll { env } => Ok(render(send(&Request::GrantAll { env })?)),
         Cmd::Clear { path } => Ok(render(send(&Request::Clear { path })?)),
         Cmd::Status | Cmd::List => Ok(render(send(&Request::Status)?)),
+        Cmd::Skill { action } => run_skill(action),
     }
+}
+
+/// Skill (un)installation runs locally; it never contacts the daemon.
+fn run_skill(action: SkillAction) -> Result<ExitCode> {
+    match action {
+        SkillAction::Install {
+            claude,
+            codex,
+            pi,
+            print,
+        } => skill::install(skill::Targets { claude, codex, pi }, print)?,
+        SkillAction::Uninstall { claude, codex, pi } => {
+            skill::uninstall(skill::Targets { claude, codex, pi })?
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Ask the daemon (gated) for the secrets in `env`, then inject and exec `argv`
