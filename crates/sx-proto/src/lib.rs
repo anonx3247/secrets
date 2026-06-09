@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 /// Environment variable that overrides the default socket path.
 pub const SOCKET_ENV: &str = "SX_SOCKET";
 
-/// Default capture lifetime if the client does not specify one.
-pub const DEFAULT_TTL_SECS: u64 = 3600;
+/// Lifetime of a grant: how long a `.env` stays usable after its first run
+/// before the next run re-prompts. One hour.
+pub const GRANT_TTL_SECS: u64 = 3600;
 
 /// Resolve the unix socket path both halves agree on.
 ///
@@ -33,36 +34,37 @@ pub fn socket_path() -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
-    /// Capture the secrets defined in a `.env` file into the daemon.
-    ///
-    /// This is the time-boxed outer envelope ("capture security"): it is
-    /// TouchID-gated and the captured values live only in daemon memory until
-    /// `ttl_secs` elapses or they are explicitly cleared. The client never
-    /// reads the file — `path` is resolved by the daemon relative to the
-    /// caller's *verified* cwd (derived from the peer pid, not sent here).
-    Capture {
-        path: String,
-        ttl_secs: Option<u64>,
-    },
-
-    /// Drop captured secrets — a single source path, or all of them.
+    /// Drop granted `.env` files — a single source path, or all of them.
     Clear { path: Option<String> },
 
-    /// Report active captures and the secret names they expose (never values).
+    /// Report active grants and the secret names they expose (never values).
     Status,
 
-    /// Request the named secrets in order to run `argv`.
+    /// Pre-authorize one or more `.env` files in *allow-all* mode: grant the
+    /// file for an hour AND suppress the per-command prompt for that window.
+    /// Runs no command — `sx grant-all --env <path>`.
+    GrantAll { env: Vec<String> },
+
+    /// Request the secrets from one or more `.env` files in order to run `argv`.
     ///
-    /// The daemon does NOT execute anything — it resolves the names against
-    /// active captures, gates on the shown command, and (if approved) returns
-    /// the values to the caller via [`Response::Granted`]. The client (`sx`),
-    /// which lives inside the sandbox, then injects them and execs `argv`
-    /// itself, so the child inherits the client's confinement and the daemon
-    /// is never an executor. `argv` is sent so the daemon can show it at the
-    /// gate; the daemon does not run it.
+    /// The daemon does NOT execute anything. For each `env` path it resolves
+    /// the file against the caller's *verified* cwd (derived from the peer pid,
+    /// not sent here). Two independent gates apply:
+    ///
+    /// * **file grant** — on first use of a path, a 1h TouchID grant reads the
+    ///   file into memory; later runs reuse it without re-reading.
+    /// * **per-command** — by default *every* run prompts to approve this
+    ///   specific command. A file in allow-all mode (via [`Request::GrantAll`]
+    ///   or `grant_all` here) skips this prompt for its window.
+    ///
+    /// It returns the merged values via [`Response::Granted`]; the client (`sx`)
+    /// injects them and execs `argv` itself. `argv` is sent so the daemon can
+    /// show it at the per-command prompt; the daemon does not run it.
     Run {
-        secrets: Vec<String>,
+        env: Vec<String>,
         argv: Vec<String>,
+        /// Upgrade the files used here to allow-all for the rest of their grant.
+        grant_all: bool,
     },
 }
 
@@ -72,13 +74,6 @@ pub enum Request {
 pub enum Response {
     /// Generic success with a human-readable message.
     Ok { message: String },
-
-    /// A capture succeeded; reports the names made available (no values).
-    Captured {
-        source: String,
-        names: Vec<String>,
-        expires_in_secs: u64,
-    },
 
     /// Current daemon state.
     Status { captures: Vec<CaptureInfo> },
@@ -96,10 +91,12 @@ pub enum Response {
     Error { message: String },
 }
 
-/// Summary of one active capture, safe to show the agent.
+/// Summary of one active grant, safe to show the agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureInfo {
     pub source: String,
     pub names: Vec<String>,
     pub expires_in_secs: u64,
+    /// True when this file is in allow-all mode (no per-command prompt).
+    pub allow_all: bool,
 }
