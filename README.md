@@ -16,9 +16,29 @@ default, a confirmation of every command.
   inherits `sx`'s sandbox and the daemon is never a way out of it. Redacts the
   values from the command's output.
 
-```sh
-sxd                                   # run the daemon (outside the sandbox)
+## Install
 
+```sh
+./install.sh        # builds, installs sx + sxd to ~/.cargo/bin, auto-starts sxd at login
+```
+
+On macOS this registers `sxd` as a per-user **LaunchAgent** (`RunAtLoad` +
+`KeepAlive`) so it starts at login and respawns if it dies. It's a LaunchAgent,
+not a LaunchDaemon, because `sxd` shows TouchID prompts — those only work inside
+your GUI session, and the daemon must run as you for the peer-credential check.
+
+```sh
+sxd install            # register + start the agent (also: --print for a dry run)
+sxd uninstall          # stop + remove it
+launchctl print gui/$(id -u)/dev.sx.sxd   # inspect; log at ~/.sx/sxd.log
+```
+
+Linux/Windows auto-start isn't wired up yet (a headless service can't present the
+approval prompt); run `sxd` manually there for now.
+
+## Usage
+
+```sh
 # Default: grant the file for 1h on first use, AND confirm every command.
 sx run --env .env -- gh pr create     # 1st use: TouchID grants .env + confirms this cmd
 sx run --env .env -- gh pr merge      # within the hour: still confirms THIS command
