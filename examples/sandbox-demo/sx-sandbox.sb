@@ -1,0 +1,17 @@
+(version 1)
+
+;; Demo Seatbelt profile standing in for "the agent's sandbox".
+;;
+;; It allows everything EXCEPT reading .env / .env.* files. That is the whole
+;; point of the demo: a process under this profile can still exec `sx` and reach
+;; the `sxd` unix socket, but it cannot read the secrets on disk — so the only
+;; way to use them is through `sx run`, which never reveals the values.
+;;
+;; A real deployment would be deny-by-default and additionally restrict network
+;; egress (so a read secret still can't leave). This permissive form keeps the
+;; demo focused on the read/use distinction.
+
+(allow default)
+
+;; The one thing the agent must NOT be able to do: read any .env file.
+(deny file-read* (regex #"/\.env($|\.)"))
