@@ -34,27 +34,43 @@ pub fn socket_path() -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
-    /// Drop granted `.env` files — a single source path, or all of them.
+    /// Drop granted sources — a single source (an `.env` path or an
+    /// `aws:<profile>` key), or all of them when `path` is `None`.
     Clear { path: Option<String> },
 
     /// Report active grants and the secret names they expose (never values).
     Status,
 
-    /// Pre-authorize one or more `.env` files in *allow-all* mode: grant the
-    /// file for an hour AND suppress the per-command prompt for that window.
-    /// Runs no command — `sx grant-all --env <path>`.
-    GrantAll { env: Vec<String> },
+    /// Pre-authorize one or more secret sources in *allow-all* mode: grant the
+    /// source for an hour AND suppress the per-command prompt for that window.
+    /// Runs no command — `sx grant-all --env <path> --aws-profile <name>`.
+    ///
+    /// Sources are either `.env` file paths (`env`) or named AWS profiles
+    /// (`aws_profiles`); both kinds are gated and TTL'd identically.
+    GrantAll {
+        env: Vec<String>,
+        /// AWS profile names to mint temporary credentials from.
+        #[serde(default)]
+        aws_profiles: Vec<String>,
+    },
 
-    /// Request the secrets from one or more `.env` files in order to run `argv`.
+    /// Request the secrets from one or more sources in order to run `argv`.
     ///
-    /// The daemon does NOT execute anything. For each `env` path it resolves
-    /// the file against the caller's *verified* cwd (derived from the peer pid,
-    /// not sent here). Two independent gates apply:
+    /// The daemon does NOT execute anything. Sources come in two flavors:
     ///
-    /// * **file grant** — on first use of a path, a 1h TouchID grant reads the
-    ///   file into memory; later runs reuse it without re-reading.
+    /// * `env` — `.env` file paths, resolved against the caller's *verified*
+    ///   cwd (derived from the peer pid, not sent here) and canonicalized.
+    /// * `aws_profiles` — named AWS profiles; the daemon mints temporary
+    ///   credentials by shelling out to `aws configure export-credentials` and
+    ///   injects the resulting `AWS_*` env vars. Keyed under `aws:<profile>`,
+    ///   never touched by filesystem resolution.
+    ///
+    /// Two independent gates apply to every source:
+    ///
+    /// * **file grant** — on first use of a source, a 1h TouchID grant reads
+    ///   (or mints) its values into memory; later runs reuse them.
     /// * **per-command** — by default *every* run prompts to approve this
-    ///   specific command. A file in allow-all mode (via [`Request::GrantAll`]
+    ///   specific command. A source in allow-all mode (via [`Request::GrantAll`]
     ///   or `grant_all` here) skips this prompt for its window.
     ///
     /// It returns the merged values via [`Response::Granted`]; the client (`sx`)
@@ -62,8 +78,11 @@ pub enum Request {
     /// show it at the per-command prompt; the daemon does not run it.
     Run {
         env: Vec<String>,
+        /// AWS profile names to mint temporary credentials from.
+        #[serde(default)]
+        aws_profiles: Vec<String>,
         argv: Vec<String>,
-        /// Upgrade the files used here to allow-all for the rest of their grant.
+        /// Upgrade the sources used here to allow-all for the rest of their grant.
         grant_all: bool,
     },
 }
@@ -94,9 +113,11 @@ pub enum Response {
 /// Summary of one active grant, safe to show the agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureInfo {
+    /// Source identity: a canonical `.env` path, or `aws:<profile>` for an
+    /// AWS-profile grant.
     pub source: String,
     pub names: Vec<String>,
     pub expires_in_secs: u64,
-    /// True when this file is in allow-all mode (no per-command prompt).
+    /// True when this source is in allow-all mode (no per-command prompt).
     pub allow_all: bool,
 }
