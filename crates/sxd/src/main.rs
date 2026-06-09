@@ -18,6 +18,7 @@
 
 mod gate;
 mod peer;
+mod service;
 mod state;
 
 use std::collections::HashMap;
@@ -40,10 +41,22 @@ struct Daemon {
 }
 
 fn main() -> Result<()> {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+
+    // Service-management subcommands run and exit; they don't start the daemon.
+    match raw.first().map(String::as_str) {
+        Some("install") => {
+            let dry_run = raw.iter().any(|a| a == "--print" || a == "--dry-run");
+            return service::install(dry_run).map_err(Into::into);
+        }
+        Some("uninstall") => return service::uninstall().map_err(Into::into),
+        _ => {}
+    }
+
     let mut socket = socket_path();
     let mut gate: Box<dyn ApprovalGate> = default_gate();
 
-    let mut args = std::env::args().skip(1);
+    let mut args = raw.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--socket" => {
@@ -52,7 +65,11 @@ fn main() -> Result<()> {
             "--no-gate" => gate = Box::new(AllowAllGate),
             "--cli-gate" => gate = Box::new(CliGate),
             "-h" | "--help" => {
-                println!("usage: sxd [--socket PATH] [--cli-gate] [--no-gate]");
+                println!(
+                    "usage: sxd [--socket PATH] [--cli-gate] [--no-gate]\n       \
+                     sxd install [--print]   # register a login auto-start agent (macOS)\n       \
+                     sxd uninstall"
+                );
                 return Ok(());
             }
             other => anyhow::bail!("unknown argument: {other}"),
