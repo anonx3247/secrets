@@ -244,8 +244,14 @@ fn exec_with_secrets(
     // Redact the injected values from whatever the command emitted before it
     // reaches our stdout/stderr (which the agent sees).
     let values: Vec<&str> = granted.iter().map(|(_, v)| v.as_str()).collect();
-    print!("{}", redact(String::from_utf8_lossy(&output.stdout), &values));
-    eprint!("{}", redact(String::from_utf8_lossy(&output.stderr), &values));
+    print!(
+        "{}",
+        redact(String::from_utf8_lossy(&output.stdout), &values)
+    );
+    eprint!(
+        "{}",
+        redact(String::from_utf8_lossy(&output.stderr), &values)
+    );
 
     Ok(ExitCode::from(
         u8::try_from(output.status.code().unwrap_or(1)).unwrap_or(1),
